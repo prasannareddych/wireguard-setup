@@ -42,12 +42,15 @@ function init_server() {
   read -p "Enter public endpoint (FQDN or IP) (e.g. vpn.example.com), or leave empty to auto-detect: " ENDPOINT_HOST
   if [[ -z "$ENDPOINT_HOST" ]]; then
     ENDPOINT_HOST=$(curl -fsSL checkip.amazonaws.com)
+    if [[ -z "$ENDPOINT_HOST" ]]; then
+      echo "[!] Could not auto-detect public IP. Aborting."
+      exit 1
+    fi
     echo "Detected public IP: $ENDPOINT_HOST"
     read -p "Use this as endpoint? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
-      while [[ -z "$ENDPOINT_HOST" ]]; do
-        read -p "Enter public endpoint (FQDN or IP): " ENDPOINT_HOST
-      done
+      echo "[!] No endpoint provided. Aborting."
+      exit 1
     fi
   fi
 
