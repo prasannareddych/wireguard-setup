@@ -1,5 +1,13 @@
 #!/bin/bash
 
+IP_ALLOC_FILE="/etc/wireguard/ip_allocations.txt"
+
+# === Step 0: Prepare IP allocation file ===
+if [ ! -f "$IP_ALLOC_FILE" ]; then
+  touch "$IP_ALLOC_FILE"
+  chmod 600 "$IP_ALLOC_FILE"
+fi
+
 # === Step 1: Get VPN username ===
 if [ -z "$1" ]; then
   read -p "Enter VPN user name: " USERNAME
@@ -12,7 +20,7 @@ else
 fi
 
 # Check for duplicate username
-if [ -d "/etc/wireguard/clients/$USERNAME" ]; then
+if grep -qw "^$USERNAME " "$IP_ALLOC_FILE"; then
   echo "[!] Client '$USERNAME' already exists. Exiting."
   exit 1
 fi
@@ -25,7 +33,7 @@ read -r ENDPOINT < ./endpoint.var
 read -r VPN_SUBNET < ./vpn_subnet.var
 read -r SERVER_PUBLIC_KEY < ./server_public.key
 
-# === Step 3: Ask user for AllowedIPs configuration ===
+# === Step 3: Choose AllowedIPs ===
 echo
 echo "Configure client routing (AllowedIPs):"
 echo "  1) Full tunnel (route all traffic via VPN) - 0.0.0.0/0"
@@ -61,27 +69,40 @@ esac
 
 echo "Using AllowedIPs: $ALLOWED_IP"
 
-# === Step 4: Prepare client config directory ===
+# === Step 4: Assign IP function ===
+assign_ip() {
+  local base_ip_prefix ip_octet assigned_ips
+  base_ip_prefix=$(echo "$VPN_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3)
+  assigned_ips=$(awk '{print $2}' "$IP_ALLOC_FILE")
+  for ip_octet in $(seq 2 254); do
+    candidate_ip="${base_ip_prefix}.${ip_octet}"
+    if ! grep -qw "$candidate_ip" <<< "$assigned_ips"; then
+      echo "$ip_octet"
+      return
+    fi
+  done
+  echo "[!] No free IP available in subnet." >&2
+  exit 1
+}
+
+# === Step 5: Get next free IP ===
+NEXT_OCTET=$(assign_ip)
+CLIENT_IP="$(echo "$VPN_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3).${NEXT_OCTET}/32"
+
+# Save allocation
+echo "$USERNAME $(echo "$CLIENT_IP" | cut -d'/' -f1)" >> "$IP_ALLOC_FILE"
+
+# === Step 6: Prepare client config directory ===
 mkdir -p "./clients/$USERNAME"
 cd "./clients/$USERNAME" || exit 1
 umask 077
 
-# === Step 5: Generate client keys ===
+# === Step 7: Generate keys ===
 CLIENT_PRESHARED_KEY=$(wg genpsk)
 CLIENT_PRIVKEY=$(wg genkey)
 CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
 
-# === Step 6: Assign client IP ===
-read -r OCTET_IP < /etc/wireguard/last_used_ip.var
-CLIENT_OCTET_IP=$((OCTET_IP + 1))
-echo "$CLIENT_OCTET_IP" > /etc/wireguard/last_used_ip.var
-
-# Build client IP (e.g. 10.8.0.2/32)
-BASE_IP=$(echo "$VPN_SUBNET" | cut -d'/' -f1)
-IP_PREFIX=$(echo "$BASE_IP" | cut -d'.' -f1-3)
-CLIENT_IP="${IP_PREFIX}.${CLIENT_OCTET_IP}/32"
-
-# === Step 7: Write client .conf file ===
+# === Step 8: Write client config ===
 cat > "$USERNAME.conf" << EOF
 [Interface]
 PrivateKey = $CLIENT_PRIVKEY
@@ -96,20 +117,20 @@ Endpoint = $ENDPOINT
 PersistentKeepalive = 25
 EOF
 
-# === Step 8: Append client to wg0.conf (server) ===
+# === Step 9: Append peer to server config ===
 cat >> /etc/wireguard/wg0.conf << EOF
 
 # $USERNAME
 [Peer]
 PublicKey = $CLIENT_PUBLIC_KEY
 PresharedKey = $CLIENT_PRESHARED_KEY
-AllowedIPs = ${CLIENT_IP}
+AllowedIPs = $(echo "$CLIENT_IP" | cut -d'/' -f1)/32
 EOF
 
-# === Step 9: Restart WireGuard to apply changes ===
+# === Step 10: Restart WireGuard ===
 systemctl restart wg-quick@wg0
 
-# === Step 10: Output results ===
+# === Step 11: Output ===
 echo
 echo "[+] VPN client '$USERNAME' added"
 echo "[*] IP address: $CLIENT_IP"
