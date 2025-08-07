@@ -9,7 +9,8 @@ DNS_FILE="$WG_DIR/dns.var"
 WAN_IF_FILE="$WG_DIR/wan_interface_name.var"
 SERVER_PRIVKEY_FILE="$WG_DIR/server_private.key"
 SERVER_PUBKEY_FILE="$WG_DIR/server_public.key"
-IP_ALLOC_FILE="$WG_DIR/ip_allocations.txt"
+VPN_SUBNET_FILE="$WG_DIR/vpn_subnet.var"
+IP_ALLOCATIONS_FILE="$WG_DIR/ip_allocations.txt"
 
 function require_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -38,16 +39,13 @@ function init_server() {
   echo "$SERVER_PRIVKEY" > "$SERVER_PRIVKEY_FILE"
   echo "$SERVER_PUBKEY" > "$SERVER_PUBKEY_FILE"
 
-  # Get endpoint fqdn or IP + port from user
   read -p "Enter public endpoint (FQDN or IP) (e.g. vpn.example.com), or leave empty to auto-detect: " ENDPOINT_HOST
-
   if [[ -z "$ENDPOINT_HOST" ]]; then
     ENDPOINT_HOST=$(curl -fsSL checkip.amazonaws.com)
     echo "Detected public IP: $ENDPOINT_HOST"
     read -p "Use this as endpoint? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
       while [[ -z "$ENDPOINT_HOST" ]]; do
-        echo "Endpoint cannot be empty."
         read -p "Enter public endpoint (FQDN or IP): " ENDPOINT_HOST
       done
     fi
@@ -55,7 +53,6 @@ function init_server() {
 
   read -p "Enter WireGuard listen port [51820]: " LISTEN_PORT
   LISTEN_PORT=${LISTEN_PORT:-51820}
-
   echo "${ENDPOINT_HOST}:${LISTEN_PORT}" > "$ENDPOINT_FILE"
 
 
@@ -65,9 +62,7 @@ function init_server() {
 
   # Extract VPN subnet prefix (assume /24)
   VPN_SUBNET=$(echo "$SERVER_IP" | awk -F. '{print $1"."$2"."$3".0/24"}')
-
-  # Save VPN subnet for later use
-  echo "$VPN_SUBNET" > "$WG_DIR/vpn_subnet.var"
+  echo "$VPN_SUBNET" > "$VPN_SUBNET_FILE"
 
   # DNS server for clients
   read -p "Enter DNS server for clients [1.1.1.1]: " DNS_SERVER
@@ -108,7 +103,7 @@ EOF
 
   # Create clients dir
   mkdir -p "$CLIENTS_DIR"
-  touch "$IP_ALLOC_FILE"
+  touch "$IP_ALLOCATIONS_FILE"
 
   systemctl enable wg-quick@wg0
   echo "[+] WireGuard server initialized."
@@ -117,43 +112,60 @@ EOF
 }
 
 function get_next_ip() {
-  local base_subnet
-  base_subnet=$(cat "$WG_DIR/vpn_subnet.var" | sed 's|/24||;s|\.[0-9]\+$|.|')
+  used_ips=$(cut -d ':' -f2 "$IP_ALLOCATIONS_FILE")
   for i in $(seq 2 254); do
-    local ip="${base_subnet}${i}"
-    if ! grep -q "$ip" "$IP_ALLOC_FILE" 2>/dev/null; then
+    ip="10.8.0.$i"
+    if ! echo "$used_ips" | grep -q "$ip"; then
       echo "$ip"
       return
     fi
   done
-  echo "No free IPs available."
+  echo "No available IPs" >&2
   exit 1
 }
 
 function add_user() {
   require_root
   local username="$1"
-  [[ -z "$username" ]] && read -p "Enter VPN username: " username
-  [[ -z "$username" ]] && { echo "Username cannot be empty."; exit 1; }
+  if [[ -z "$username" ]]; then
+    read -p "Enter VPN username: " username
+    [[ -z "$username" ]] && echo "Username cannot be empty." && exit 1
+  fi
 
-  if [[ -d "$CLIENTS_DIR/$username" ]]; then
+  if grep -q "^$username:" "$IP_ALLOCATIONS_FILE"; then
     echo "User '$username' already exists."
     exit 1
   fi
+
+  client_ip=$(get_next_ip)
+  echo "$username:$client_ip" >> "$IP_ALLOCATIONS_FILE"
 
   mkdir -p "$CLIENTS_DIR/$username"
   cd "$CLIENTS_DIR/$username"
   umask 077
 
-  local client_privkey=$(wg genkey)
-  local client_pubkey=$(echo "$client_privkey" | wg pubkey)
-  local client_preshared_key=$(wg genpsk)
-  local server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
-  local dns_server=$(cat "$DNS_FILE")
-  local endpoint=$(cat "$ENDPOINT_FILE")
-  local client_ip=$(get_next_ip)
+  client_privkey=$(wg genkey)
+  client_pubkey=$(echo "$client_privkey" | wg pubkey)
+  client_preshared_key=$(wg genpsk)
 
-  echo "$username $client_ip" >> "$IP_ALLOC_FILE"
+  echo "$client_privkey" > "${username}_private.key"
+  echo "$client_pubkey" > "${username}_public.key"
+  echo "$client_preshared_key" > "${username}_preshared.key"
+
+  server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
+  dns_server=$(cat "$DNS_FILE")
+  endpoint=$(cat "$ENDPOINT_FILE")
+
+  echo "[*] Choose AllowedIPs for client:"
+  echo "1) Full tunnel (0.0.0.0/0)"
+  echo "2) VPN subnet only (e.g. 10.8.0.0/24)"
+  echo "3) Custom"
+  read -p "Selection [1-3]: " mode
+  case $mode in
+    2) allowed_ips=$(cat "$VPN_SUBNET_FILE") ;;
+    3) read -p "Enter custom AllowedIPs (comma-separated): " allowed_ips ;;
+    *) allowed_ips="0.0.0.0/0" ;;
+  esac
 
   cat > "${username}.conf" <<EOF
 [Interface]
@@ -164,14 +176,10 @@ DNS = $dns_server
 [Peer]
 PublicKey = $server_pubkey
 PresharedKey = $client_preshared_key
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = $allowed_ips
 Endpoint = $endpoint
 PersistentKeepalive = 25
 EOF
-
-  echo "$client_privkey" > "${username}_private.key"
-  echo "$client_pubkey" > "${username}_public.key"
-  echo "$client_preshared_key" > "${username}_preshared.key"
 
   cat >> "$WG_CONF" <<EOF
 
@@ -184,94 +192,62 @@ EOF
   systemctl restart wg-quick@wg0
 
   echo "[+] User '$username' added."
-  echo "Client config:"
   cat "${username}.conf"
-  echo -e "
-QR code:"
+  echo -e "\nQR code:"
   qrencode -t ansiutf8 < "${username}.conf"
 }
 
 function delete_user() {
   require_root
   local username="$1"
-  [[ -z "$username" ]] && { echo "Username required."; exit 1; }
-  [[ ! -d "$CLIENTS_DIR/$username" ]] && { echo "User does not exist."; exit 1; }
+  [[ -z "$username" ]] && echo "Specify username to delete." && exit 1
 
-  local pubkey=$(cat "$CLIENTS_DIR/$username/${username}_public.key")
-  sed -i "/^\[Peer\]/,/^$/ {/PublicKey = $pubkey/,+2d}" "$WG_CONF"
-  sed -i "/^$username /d" "$IP_ALLOC_FILE"
+  user_dir="$CLIENTS_DIR/$username"
+  [[ ! -d "$user_dir" ]] && echo "User not found." && exit 1
 
-  rm -rf "$CLIENTS_DIR/$username"
+  pubkey=$(cat "$user_dir/${username}_public.key")
+  sed -i "/^\[Peer\]/,/^$/ {/PublicKey = $pubkey/d}" "$WG_CONF"
+
+  grep -v "^$username:" "$IP_ALLOCATIONS_FILE" > "$IP_ALLOCATIONS_FILE.tmp" && mv "$IP_ALLOCATIONS_FILE.tmp" "$IP_ALLOCATIONS_FILE"
+  rm -rf "$user_dir"
+
   systemctl restart wg-quick@wg0
-
   echo "[+] User '$username' deleted."
 }
 
 function list_users() {
-  if [[ ! -d "$CLIENTS_DIR" ]]; then
-    echo "No users found."
-    exit 0
-  fi
-
   echo "VPN users:"
-  ls "$CLIENTS_DIR"
+  cut -d ':' -f1 "$IP_ALLOCATIONS_FILE"
 }
 
 function show_user() {
   local username="$1"
-  [[ -z "$username" ]] && { echo "Username required."; exit 1; }
-  local conf_file="$CLIENTS_DIR/$username/${username}.conf"
-  [[ ! -f "$conf_file" ]] && { echo "Config not found."; exit 1; }
+  [[ -z "$username" ]] && echo "Specify username." && exit 1
 
-  local client_privkey=$(cat "$CLIENTS_DIR/$username/${username}_private.key")
-  local client_preshared_key=$(cat "$CLIENTS_DIR/$username/${username}_preshared.key")
-  local server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
-  local dns_server=$(cat "$DNS_FILE")
-  local endpoint=$(cat "$ENDPOINT_FILE")
-  local client_ip=$(grep '^Address' "$conf_file" | awk '{print $3}')
+  conf="$CLIENTS_DIR/$username/${username}.conf"
+  [[ ! -f "$conf" ]] && echo "User config not found." && exit 1
 
-  cat > /tmp/"$username".conf <<EOF
-[Interface]
-PrivateKey = $client_privkey
-Address = $client_ip
-DNS = $dns_server
-
-[Peer]
-PublicKey = $server_pubkey
-PresharedKey = $client_preshared_key
-AllowedIPs = 0.0.0.0/0
-Endpoint = $endpoint
-PersistentKeepalive = 25
-EOF
-
-  echo "Client config for user '$username':"
-  cat /tmp/"$username".conf
-  echo -e "
-QR code:"
-  qrencode -t ansiutf8 < /tmp/"$username".conf
-  rm /tmp/"$username".conf
+  echo "Client config for '$username':"
+  cat "$conf"
+  echo -e "\nQR code:"
+  qrencode -t ansiutf8 < "$conf"
 }
 
 function update_endpoint() {
   require_root
-  echo "Current endpoint: $(cat $ENDPOINT_FILE)"
-  read -p "Enter new endpoint (FQDN or IP:port): " NEW_ENDPOINT
-  [[ -z "$NEW_ENDPOINT" ]] && { echo "No endpoint entered. Aborting."; exit 1; }
+  echo "Current endpoint: $(cat "$ENDPOINT_FILE")"
+  read -p "Enter new endpoint (FQDN or IP:port): " new_endpoint
+  [[ -z "$new_endpoint" ]] && echo "Aborted." && exit 1
 
-  echo "$NEW_ENDPOINT" > "$ENDPOINT_FILE"
-  echo "[*] Endpoint updated to $NEW_ENDPOINT"
+  echo "$new_endpoint" > "$ENDPOINT_FILE"
+  echo "[*] Endpoint updated. Regenerating client configs..."
 
-  # Restart wg-quick to reload endpoint for clients (clients keep old endpoints until reconnected)
-  systemctl restart wg-quick@wg0
-  echo "[*] Endpoint updated."
-
-  for user_dir in "$CLIENTS_DIR"/*; do
-    if [[ -d "$user_dir" ]]; then
-      local username=$(basename "$user_dir")
-      show_user "$username" > "$user_dir/${username}.conf"
-    fi
+  for user in $(cut -d ':' -f1 "$IP_ALLOCATIONS_FILE"); do
+    show_user "$user" > "$CLIENTS_DIR/$user/${user}.conf"
   done
-  echo "[+] All client configs updated with new endpoint."
+
+  systemctl restart wg-quick@wg0
+  echo "[+] All client configs updated."
 }
 
 function usage() {
