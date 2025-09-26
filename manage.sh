@@ -88,10 +88,10 @@ function init_server() {
   # Create WireGuard config file
   cat > "$WG_CONF" <<EOF
 [Interface]
-Address = $SERVER_IP/24
+Address = $SERVER_IP/32
 ListenPort = $LISTEN_PORT
 PrivateKey = $SERVER_PRIVKEY
-SaveConfig = true
+SaveConfig = false
 
 PostUp = iptables -I INPUT -p udp --dport $LISTEN_PORT -j ACCEPT
 PostUp = iptables -I FORWARD -i $WAN_INTERFACE_NAME -o wg0 -j ACCEPT
@@ -142,35 +142,30 @@ function add_user() {
 
   client_ip=$(get_next_ip)
   echo "$username:$client_ip" >> "$IP_ALLOCATIONS_FILE"
-
-  mkdir -p "$CLIENTS_DIR/$username"
-  cd "$CLIENTS_DIR/$username"
-  umask 077
+  mkdir -p $CLIENTS_DIR
+  userconf="$CLIENTS_DIR/$username.conf"
 
   client_privkey=$(wg genkey)
   client_pubkey=$(echo "$client_privkey" | wg pubkey)
   client_preshared_key=$(wg genpsk)
 
-  echo "$client_privkey" > "${username}_private.key"
-  echo "$client_pubkey" > "${username}_public.key"
-  echo "$client_preshared_key" > "${username}_preshared.key"
-
   server_pubkey=$(cat "$SERVER_PUBKEY_FILE")
   dns_server=$(cat "$DNS_FILE")
   endpoint=$(cat "$ENDPOINT_FILE")
-
+  subnet=$(cat "$VPN_SUBNET_FILE")  
   echo "[*] Choose AllowedIPs for client:"
   echo "1) Full tunnel (0.0.0.0/0)"
-  echo "2) VPN subnet only (e.g. 10.8.0.0/24)"
-  echo "3) Custom"
-  read -p "Selection [1-3]: " mode
+  echo "2) VPN subnet only [$subnet]"
+  echo "3) VPN client only [$client_ip/32]"
+  echo "4) Custom"
+  read -p "Selection [1-4]: " mode
   case $mode in
     2) allowed_ips=$(cat "$VPN_SUBNET_FILE") ;;
-    3) read -p "Enter custom AllowedIPs (comma-separated): " allowed_ips ;;
+    3) allowed_ips="$client_ip/32" ;;
+    4) read -p "Enter custom AllowedIPs (comma-separated): " allowed_ips ;;
     *) allowed_ips="0.0.0.0/0" ;;
   esac
-
-  cat > "${username}.conf" <<EOF
+  cat > $userconf <<EOF
 [Interface]
 PrivateKey = $client_privkey
 Address = $client_ip/32
@@ -186,6 +181,7 @@ EOF
 
   cat >> "$WG_CONF" <<EOF
 
+# $username
 [Peer]
 PublicKey = $client_pubkey
 PresharedKey = $client_preshared_key
@@ -193,11 +189,12 @@ AllowedIPs = $client_ip/32
 EOF
 
   systemctl restart wg-quick@wg0
-
+  
   echo "[+] User '$username' added."
-  cat "${username}.conf"
   echo -e "\nQR code:"
-  qrencode -t ansiutf8 < "${username}.conf"
+  qrencode -t ansiutf8 < $userconf
+  cat $userconf
+
 }
 
 function delete_user() {
@@ -205,18 +202,22 @@ function delete_user() {
   local username="$1"
   [[ -z "$username" ]] && echo "Specify username to delete." && exit 1
 
-  user_dir="$CLIENTS_DIR/$username"
-  [[ ! -d "$user_dir" ]] && echo "User not found." && exit 1
+  local userconf="$CLIENTS_DIR/${username}.conf"
+  [[ ! -f "$userconf" ]] && echo "User '$username' not found." && exit 1
 
-  pubkey=$(cat "$user_dir/${username}_public.key")
-  sed -i "/^\[Peer\]/,/^$/ {/PublicKey = $pubkey/d}" "$WG_CONF"
+  # Remove the [Peer] block tagged by the username
+  sed -i "/^# $username$/,/^$/d" "$WG_CONF"
 
+  # Remove from IP allocations
   grep -v "^$username:" "$IP_ALLOCATIONS_FILE" > "$IP_ALLOCATIONS_FILE.tmp" && mv "$IP_ALLOCATIONS_FILE.tmp" "$IP_ALLOCATIONS_FILE"
-  rm -rf "$user_dir"
+
+  # Remove config file
+  rm -f "$userconf"
 
   systemctl restart wg-quick@wg0
   echo "[+] User '$username' deleted."
 }
+
 
 function list_users() {
   echo "VPN users:"
@@ -227,7 +228,7 @@ function show_user() {
   local username="$1"
   [[ -z "$username" ]] && echo "Specify username." && exit 1
 
-  conf="$CLIENTS_DIR/$username/${username}.conf"
+  conf="$CLIENTS_DIR/$username.conf"
   [[ ! -f "$conf" ]] && echo "User config not found." && exit 1
 
   echo "Client config for '$username':"
@@ -238,20 +239,35 @@ function show_user() {
 
 function update_endpoint() {
   require_root
-  echo "Current endpoint: $(cat "$ENDPOINT_FILE")"
-  read -p "Enter new endpoint (FQDN or IP:port): " new_endpoint
-  [[ -z "$new_endpoint" ]] && echo "Aborted." && exit 1
 
-  echo "$new_endpoint" > "$ENDPOINT_FILE"
-  echo "[*] Endpoint updated. Regenerating client configs..."
+  read -p "Enter new public endpoint (FQDN or IP), or leave empty to auto-detect: " NEW_HOST
 
-  for user in $(cut -d ':' -f1 "$IP_ALLOCATIONS_FILE"); do
-    show_user "$user" > "$CLIENTS_DIR/$user/${user}.conf"
+  if [[ -z "$NEW_HOST" ]]; then
+    NEW_HOST=$(curl -fsSL checkip.amazonaws.com)
+    echo "Detected public IP: $NEW_HOST"
+    read -p "Use this as endpoint? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+
+  read -p "Enter WireGuard listen port [51820]: " NEW_PORT
+  NEW_PORT=${NEW_PORT:-51820}
+
+  NEW_ENDPOINT="${NEW_HOST}:${NEW_PORT}"
+  echo "[*] Updating all client configs with new endpoint: $NEW_ENDPOINT"
+
+  for userconf in "$CLIENTS_DIR"/*.conf; do
+    [[ -f "$userconf" ]] || continue
+
+    # Edit Endpoint line in [Peer] section
+    sed -i "s|^Endpoint = .*|Endpoint = $NEW_ENDPOINT|" "$userconf"
   done
 
-  systemctl restart wg-quick@wg0
-  echo "[+] All client configs updated."
+  echo "[+] Endpoint updated in all client configs."
 }
+
 
 function usage() {
   echo "Usage: $0 {init|add|delete|list|show|update-endpoint} [username]"
